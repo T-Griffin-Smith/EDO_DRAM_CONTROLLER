@@ -1,0 +1,623 @@
+`timescale 1ns/1ps
+
+module EDO_DRAM_CONTROLLER (
+    // FSM Inputs
+    input  wire        CLK100MHz,
+    input  wire        RESET_N,
+    input  wire        SWITCH_START,
+    input  wire        SWITCH_HIGH_OR_LOW,
+
+    // Displays
+    output reg  [15:0] LED_OUT,
+    output reg  [6:0]  SEG_OUT,
+    output reg  [7:0]  AN_OUT,
+
+    // To microcontroller
+    output reg         READ_TRIGGER,
+
+    // DRAM Interface
+    inout  wire [15:0] data_bus,
+    output reg  [8:0]  address_bus,
+    output reg         OE_N,
+    output reg         WE_N,
+    output reg         LCAS_N,
+    output reg         UCAS_N,
+    output reg         RAS_N
+);
+
+    // Timing (100MHz => 10ns/cycle), conservative for -60ns class
+    localparam integer C_RP         = 4;   // 40ns RAS precharge
+    localparam integer C_RCD        = 2;   // 20ns RAS->CAS
+    localparam integer C_RAS_MIN    = 6;   // 60ns RAS low min
+    localparam integer C_CAS_MIN    = 1;   // 10ns CAS low min
+    localparam integer C_CWL        = 2;   // 20ns WE lead CAS
+    localparam integer C_WE_MIN     = 1;   // 10ns WE low min
+    localparam integer C_DH         = 1;   // 10ns data hold
+    localparam integer C_READ_VALID = 4;   // 40ns read valid (tAA margin)
+
+    // Refresh + init parameters (100MHz)
+    localparam integer REFRESH_INTERVAL_CYCLES = 1000;   // 10us @ 100MHz
+    localparam integer PWRUP_DELAY_CYCLES      = 20000;  // 200us @ 100MHz
+    localparam integer INIT_REFRESH_CYCLES     = 8;      // 8 init cycles
+
+    // READ pacing to avoid dropped addresses (100MHz)
+    // This throttles how often the FPGA issues a DRAM READ request during M_READ.
+    // Choose this based on your MCU+serial throughput (e.g., 200us => 20000 cycles).
+    localparam integer READ_PACE_CYCLES = 20000; // 200us @ 100MHz
+    reg [15:0] read_pace_cnt;
+
+    // READ_TRIGGER pulse shaping with enforced LOW time (100MHz)
+    // Purely for pacing for the external read trigger.
+    // This does NOT control DRAM read rate (READ_PACE_CYCLES does that).
+    localparam integer READ_TRIG_HIGH_CYCLES = 2000;   // 20us high
+    localparam integer READ_TRIG_LOW_CYCLES  = 2000;   // 20us forced low
+
+    reg [15:0] read_trig_hi_cnt;
+    reg [15:0] read_trig_lo_cnt;
+
+    // Data bus must be tri-state when memory is being read by separate microcontroller.
+    reg [15:0] dq_out;
+    reg        dq_oe;
+    assign data_bus = dq_oe ? dq_out : 16'hZZZZ;
+    wire [15:0] dq_in;
+    assign dq_in = data_bus;
+
+    // Start pulse detect
+    reg start_d;
+    wire start_pulse;
+    assign start_pulse = SWITCH_START & ~start_d;
+
+    // March test states
+    localparam [2:0] M_BOOT  = 3'd0;
+    localparam [2:0] M_IDLE  = 3'd1;
+    localparam [2:0] M_WRITE = 3'd2;
+    localparam [2:0] M_READ  = 3'd3;
+
+    reg [2:0] mstate;
+
+    reg [17:0] addr_ctr;
+
+    reg pattern_is_ones;
+    wire [15:0] test_pattern;
+    assign test_pattern = pattern_is_ones ? 16'hFFFF : 16'h0000;
+
+    reg [15:0] last_read_data;
+
+    // DRAM low-level controller states
+    localparam [5:0] D_IDLE           = 6'd0;
+    localparam [5:0] D_PRECHARGE      = 6'd1;
+    localparam [5:0] D_PRECHARGE_WAIT = 6'd2;
+
+    localparam [5:0] D_ROW_SETUP      = 6'd3;
+    localparam [5:0] D_RAS_LOW        = 6'd4;
+    localparam [5:0] D_RCD_WAIT       = 6'd5;
+
+    // WRITE (early write)
+    localparam [5:0] D_W_COL_SETUP    = 6'd6;
+    localparam [5:0] D_W_CAS_LOW      = 6'd9;
+    localparam [5:0] D_W_CAS_HOLD     = 6'd10;
+    localparam [5:0] D_W_WE_HOLD      = 6'd12;
+
+    // READ
+    localparam [5:0] D_R_COL_SETUP    = 6'd14;
+    localparam [5:0] D_R_WAIT_VALID   = 6'd17;
+    localparam [5:0] D_R_SAMPLE       = 6'd18;
+
+    // End cycle
+    localparam [5:0] D_TRAS_ENSURE    = 6'd21;
+    localparam [5:0] D_RAS_HIGH       = 6'd22;
+    localparam [5:0] D_DONE           = 6'd23;
+
+    // CBR refresh states
+    localparam [5:0] D_CBR_SETUP      = 6'd24; // CAS low, then RAS low
+    localparam [5:0] D_CBR_RAS_LOW    = 6'd25;
+    localparam [5:0] D_CBR_TRAS_WAIT  = 6'd26;
+    localparam [5:0] D_CBR_RAS_HIGH   = 6'd27;
+    localparam [5:0] D_CBR_CAS_HIGH   = 6'd28;
+
+    reg [5:0] dstate;
+
+    // DRAM request interface
+    reg        req_valid;
+    reg        req_rw;       // 1=read, 0=write
+    reg [17:0] req_addr;
+    reg [15:0] req_wdata;
+
+    // refresh request flag
+    reg        refresh_req;
+
+    reg [15:0] resp_rdata;
+
+    reg [7:0]  dtimer;
+    reg [7:0]  ras_low_cnt;
+
+    // Refresh timer + init sequencing
+    reg [15:0] refresh_timer;
+    reg [15:0] pwrup_timer;
+    reg [3:0]  init_count;
+    reg        init_done;
+
+    // Seven-seg decimal: 16-bit to 5-digit BCD
+    reg [3:0] bcd0, bcd1, bcd2, bcd3, bcd4;
+    integer i;
+    reg [35:0] shift;
+
+    always @(*) begin
+        shift = 36'd0;
+        shift[15:0] = last_read_data;
+
+        for (i = 0; i < 16; i = i + 1) begin
+            if (shift[19:16] >= 5) shift[19:16] = shift[19:16] + 3;
+            if (shift[23:20] >= 5) shift[23:20] = shift[23:20] + 3;
+            if (shift[27:24] >= 5) shift[27:24] = shift[27:24] + 3;
+            if (shift[31:28] >= 5) shift[31:28] = shift[31:28] + 3;
+            if (shift[35:32] >= 5) shift[35:32] = shift[35:32] + 3;
+            shift = shift << 1;
+        end
+
+        bcd0 = shift[19:16];
+        bcd1 = shift[23:20];
+        bcd2 = shift[27:24];
+        bcd3 = shift[31:28];
+        bcd4 = shift[35:32];
+    end
+
+    function [6:0] seg_dec;
+        input [3:0] digit;
+        begin
+            case (digit)
+                4'd0: seg_dec = 7'b0000001;
+                4'd1: seg_dec = 7'b1001111;
+                4'd2: seg_dec = 7'b0010010;
+                4'd3: seg_dec = 7'b0000110;
+                4'd4: seg_dec = 7'b1001100;
+                4'd5: seg_dec = 7'b0100100;
+                4'd6: seg_dec = 7'b0100000;
+                4'd7: seg_dec = 7'b0001111;
+                4'd8: seg_dec = 7'b0000000;
+                4'd9: seg_dec = 7'b0000100;
+                default: seg_dec = 7'b1111111;
+            endcase
+        end
+    endfunction
+
+    reg [19:0] mux_cnt;
+    wire [2:0] mux_sel;
+    assign mux_sel = mux_cnt[19:17];
+
+    always @(posedge CLK100MHz or negedge RESET_N) begin
+        if (!RESET_N) mux_cnt <= 20'd0;
+        else          mux_cnt <= mux_cnt + 1;
+    end
+
+    always @(*) begin
+        AN_OUT  = 8'b11111111;
+        SEG_OUT = 7'b1111111;
+
+        case (mux_sel)
+            3'd0: begin AN_OUT = 8'b11111110; SEG_OUT = seg_dec(bcd0); end
+            3'd1: begin AN_OUT = 8'b11111101; SEG_OUT = seg_dec(bcd1); end
+            3'd2: begin AN_OUT = 8'b11111011; SEG_OUT = seg_dec(bcd2); end
+            3'd3: begin AN_OUT = 8'b11110111; SEG_OUT = seg_dec(bcd3); end
+            3'd4: begin AN_OUT = 8'b11101111; SEG_OUT = seg_dec(bcd4); end
+            3'd5: begin AN_OUT = 8'b11011111; SEG_OUT = 7'b1111111; end
+            3'd6: begin AN_OUT = 8'b10111111; SEG_OUT = 7'b1111111; end
+            3'd7: begin AN_OUT = 8'b01111111; SEG_OUT = 7'b1111111; end
+        endcase
+    end
+
+    // Main sequential logic
+    always @(posedge CLK100MHz or negedge RESET_N) begin
+        if (!RESET_N) begin
+            start_d          <= 1'b0;
+
+            mstate           <= M_BOOT;
+            addr_ctr         <= 18'd0;
+            pattern_is_ones  <= 1'b0;
+            last_read_data   <= 16'h0000;
+
+            dstate           <= D_IDLE;
+            req_valid        <= 1'b0;
+            req_rw           <= 1'b0;
+            req_addr         <= 18'd0;
+            req_wdata        <= 16'h0000;
+            refresh_req      <= 1'b0;
+
+            resp_rdata       <= 16'h0000;
+
+            dtimer           <= 8'd0;
+            ras_low_cnt      <= 8'd0;
+
+            RAS_N            <= 1'b1;
+            LCAS_N           <= 1'b1;
+            UCAS_N           <= 1'b1;
+            WE_N             <= 1'b1;
+            OE_N             <= 1'b1;
+            address_bus      <= 9'h000;
+
+            dq_out           <= 16'h0000;
+            dq_oe            <= 1'b0;
+
+            // refresh/init
+            refresh_timer    <= 16'd0;
+            pwrup_timer      <= 16'd0;
+            init_count       <= 4'd0;
+            init_done        <= 1'b0;
+
+            // read pacing
+            read_pace_cnt    <= 16'd0;
+
+            // trigger high/low enforcement
+            read_trig_hi_cnt <= 16'd0;
+            read_trig_lo_cnt <= 16'd0;
+            READ_TRIGGER     <= 1'b0;
+
+            LED_OUT          <= 16'h0000;
+        end else begin
+            start_d <= SWITCH_START;
+
+            // READ pacing counter
+            if (read_pace_cnt != 16'd0)
+                read_pace_cnt <= read_pace_cnt - 16'd1;
+
+            // READ_TRIGGER pulse generator with enforced LOW time
+            // Priority: count down HIGH, then count down enforced LOW.
+            if (read_trig_hi_cnt != 16'd0) begin
+                read_trig_hi_cnt <= read_trig_hi_cnt - 16'd1;
+
+                // when HIGH just finished, start enforced LOW window
+                if (read_trig_hi_cnt == 16'd1) begin
+                    read_trig_lo_cnt <= READ_TRIG_LOW_CYCLES[15:0];
+                end
+            end else if (read_trig_lo_cnt != 16'd0) begin
+                read_trig_lo_cnt <= read_trig_lo_cnt - 16'd1;
+            end
+
+            // Output high only during HIGH count; forced low otherwise
+            READ_TRIGGER <= (read_trig_hi_cnt != 16'd0);
+
+            // Power-up init: wait 200us, then perform 8 CBR refresh cycles
+            if (!init_done) begin
+                mstate <= M_BOOT;
+
+                if (pwrup_timer < PWRUP_DELAY_CYCLES)
+                    pwrup_timer <= pwrup_timer + 1;
+                else begin
+                    if (init_count < INIT_REFRESH_CYCLES) begin
+                        if (dstate == D_IDLE && !req_valid && !refresh_req)
+                            refresh_req <= 1'b1;
+
+                        if (dstate == D_DONE) begin
+                            init_count <= init_count + 1;
+                        end
+                    end else begin
+                        init_done <= 1'b1;
+                        mstate    <= M_IDLE;
+                    end
+                end
+            end
+
+            // Refresh timer (after init)
+            if (init_done) begin
+                if (dstate == D_IDLE) begin
+                    if (refresh_timer < REFRESH_INTERVAL_CYCLES)
+                        refresh_timer <= refresh_timer + 1;
+                end
+
+                // If any cycle occurs, reset timer
+                if (dstate != D_IDLE)
+                    refresh_timer <= 16'd0;
+
+                // Schedule refresh whenever the DRAM FSM is idle and no request is pending.
+                // (This allows refresh between paced reads/writes, not only in M_IDLE.)
+                if ((dstate == D_IDLE) && !req_valid && !refresh_req) begin
+                    if (refresh_timer >= REFRESH_INTERVAL_CYCLES)
+                        refresh_req <= 1'b1;
+                end
+            end
+
+            // March test FSM (only after init_done)
+            if (init_done) begin
+                case (mstate)
+                    M_IDLE: begin
+                        // keep read pacing cleared while idle
+                        read_pace_cnt <= 16'd0;
+
+                        if (start_pulse) begin
+                            pattern_is_ones <= SWITCH_HIGH_OR_LOW;
+                            addr_ctr        <= 18'd0;
+                            mstate          <= M_WRITE;
+                        end
+                    end
+
+                    M_WRITE: begin
+                        if (!req_valid && (dstate == D_IDLE) && !refresh_req) begin
+                            req_valid <= 1'b1;
+                            req_rw    <= 1'b0;
+                            req_addr  <= addr_ctr;
+                            req_wdata <= test_pattern;
+                        end
+
+                        if (dstate == D_DONE) begin
+                            req_valid <= 1'b0;
+                            if (addr_ctr == 18'h3FFFF) begin
+                                addr_ctr      <= 18'd0;
+                                mstate        <= M_READ;
+                                read_pace_cnt <= 16'd0; // allow first read immediately
+                            end else begin
+                                addr_ctr <= addr_ctr + 1;
+                            end
+                        end
+                    end
+
+                    M_READ: begin
+                        // Issue a read only when pacing allows it.
+                        if (!req_valid && (dstate == D_IDLE) && !refresh_req && (read_pace_cnt == 16'd0)) begin
+                            req_valid <= 1'b1;
+                            req_rw    <= 1'b1;
+                            req_addr  <= addr_ctr;
+                            req_wdata <= 16'h0000;
+                        end
+
+                        if (dstate == D_DONE) begin
+                            req_valid <= 1'b0;
+
+                            last_read_data <= resp_rdata;
+
+                            // Throttle next read to avoid outrunning the MCU/serial link.
+                            read_pace_cnt <= READ_PACE_CYCLES[15:0];
+
+                            // Start a new HIGH pulse only if we're not currently in HIGH
+                            // AND we're not currently enforcing LOW time.
+                            if ((read_trig_hi_cnt == 16'd0) && (read_trig_lo_cnt == 16'd0)) begin
+                                read_trig_hi_cnt <= READ_TRIG_HIGH_CYCLES[15:0];
+                            end
+
+                            if (addr_ctr == 18'h3FFFF) begin
+                                addr_ctr      <= 18'd0;
+                                mstate        <= M_IDLE;
+                                read_pace_cnt <= 16'd0;
+                            end else begin
+                                addr_ctr <= addr_ctr + 1;
+                            end
+                        end
+                    end
+
+                    default: mstate <= M_IDLE;
+                endcase
+            end
+
+            // DRAM timing counters
+            if (dstate == D_IDLE)
+                dtimer <= 8'd0;
+            else
+                dtimer <= dtimer + 1;
+
+            if (RAS_N == 1'b0)
+                ras_low_cnt <= ras_low_cnt + 1;
+            else
+                ras_low_cnt <= 8'd0;
+
+            // DRAM low-level FSM
+            // Priority: service refresh_req if no normal req_valid.
+            case (dstate)
+                D_IDLE: begin
+                    RAS_N  <= 1'b1;
+                    LCAS_N <= 1'b1;
+                    UCAS_N <= 1'b1;
+                    WE_N   <= 1'b1;
+                    OE_N   <= 1'b1;
+                    dq_oe  <= 1'b0;
+
+                    if (refresh_req && !req_valid) begin
+                        dstate <= D_PRECHARGE;
+                        dtimer <= 8'd0;
+                    end else if (req_valid) begin
+                        dstate <= D_PRECHARGE;
+                        dtimer <= 8'd0;
+                    end
+                end
+
+                D_PRECHARGE: begin
+                    RAS_N  <= 1'b1;
+                    LCAS_N <= 1'b1;
+                    UCAS_N <= 1'b1;
+                    WE_N   <= 1'b1;
+                    OE_N   <= 1'b1;
+                    dq_oe  <= 1'b0;
+                    dtimer <= 8'd0;
+                    dstate <= D_PRECHARGE_WAIT;
+                end
+
+                D_PRECHARGE_WAIT: begin
+                    if (dtimer >= C_RP) begin
+                        dtimer <= 8'd0;
+                        if (refresh_req && !req_valid)
+                            dstate <= D_CBR_SETUP;
+                        else
+                            dstate <= D_ROW_SETUP;
+                    end
+                end
+
+                // NORMAL ACCESS
+                D_ROW_SETUP: begin
+                    address_bus <= req_addr[17:9];
+                    dstate      <= D_RAS_LOW;
+                    dtimer      <= 8'd0;
+                end
+
+                D_RAS_LOW: begin
+                    RAS_N       <= 1'b0;
+                    LCAS_N      <= 1'b1;
+                    UCAS_N      <= 1'b1;
+                    WE_N        <= 1'b1;
+                    OE_N        <= 1'b1;
+                    dq_oe       <= 1'b0;
+                    dtimer      <= 8'd0;
+                    ras_low_cnt <= 8'd0;
+                    dstate      <= D_RCD_WAIT;
+                end
+
+                D_RCD_WAIT: begin
+                    if (dtimer >= C_RCD) begin
+                        dtimer <= 8'd0;
+                        if (req_rw) dstate <= D_R_COL_SETUP;
+                        else        dstate <= D_W_COL_SETUP;
+                    end
+                end
+
+                // WRITE (early write, full word)
+                D_W_COL_SETUP: begin
+                    address_bus <= req_addr[8:0];
+                    dq_out      <= req_wdata;
+                    dq_oe       <= 1'b1;
+                    OE_N        <= 1'b1;
+                    WE_N        <= 1'b0;      // early write
+                    dtimer      <= 8'd0;
+                    dstate      <= D_W_CAS_LOW;
+                end
+
+                D_W_CAS_LOW: begin
+                    if (dtimer < C_CWL) begin
+                        WE_N   <= 1'b0;
+                        dq_out <= req_wdata;
+                        dq_oe  <= 1'b1;
+                    end else begin
+                        LCAS_N <= 1'b0;
+                        UCAS_N <= 1'b0;
+                        WE_N   <= 1'b0;
+                        dq_out <= req_wdata;
+                        dq_oe  <= 1'b1;
+                        dtimer <= 8'd0;
+                        dstate <= D_W_CAS_HOLD;
+                    end
+                end
+
+                D_W_CAS_HOLD: begin
+                    if (dtimer >= C_CAS_MIN) begin
+                        LCAS_N <= 1'b1;
+                        UCAS_N <= 1'b1;
+                        dtimer <= 8'd0;
+                        dstate <= D_W_WE_HOLD;
+                    end
+                end
+
+                D_W_WE_HOLD: begin
+                    if (dtimer >= ((C_WE_MIN > C_DH) ? C_WE_MIN : C_DH)) begin
+                        WE_N   <= 1'b1;
+                        dq_oe  <= 1'b0;
+                        dtimer <= 8'd0;
+                        dstate <= D_TRAS_ENSURE;
+                    end else begin
+                        WE_N   <= 1'b0;
+                        dq_out <= req_wdata;
+                        dq_oe  <= 1'b1;
+                    end
+                end
+
+                // READ (full word)
+                D_R_COL_SETUP: begin
+                    address_bus <= req_addr[8:0];
+                    dq_oe       <= 1'b0;
+                    WE_N        <= 1'b1;
+                    OE_N        <= 1'b0;
+                    LCAS_N      <= 1'b0;
+                    UCAS_N      <= 1'b0;
+                    dtimer      <= 8'd0;
+                    dstate      <= D_R_WAIT_VALID;
+                end
+
+                D_R_WAIT_VALID: begin
+                    if (dtimer >= C_READ_VALID) begin
+                        dstate <= D_R_SAMPLE;
+                    end
+                end
+
+                D_R_SAMPLE: begin
+                    resp_rdata <= dq_in;
+                    LCAS_N     <= 1'b1;
+                    UCAS_N     <= 1'b1;
+                    OE_N       <= 1'b1;
+                    dtimer     <= 8'd0;
+                    dstate     <= D_TRAS_ENSURE;
+                end
+
+                D_TRAS_ENSURE: begin
+                    if (ras_low_cnt >= C_RAS_MIN) begin
+                        dstate <= D_RAS_HIGH;
+                        dtimer <= 8'd0;
+                    end
+                end
+
+                D_RAS_HIGH: begin
+                    RAS_N  <= 1'b1;
+                    LCAS_N <= 1'b1;
+                    UCAS_N <= 1'b1;
+                    WE_N   <= 1'b1;
+                    OE_N   <= 1'b1;
+                    dq_oe  <= 1'b0;
+                    dstate <= D_DONE;
+                end
+
+                // CBR REFRESH
+                D_CBR_SETUP: begin
+                    dq_oe  <= 1'b0;
+                    WE_N   <= 1'b1;
+                    OE_N   <= 1'b1;
+                    LCAS_N <= 1'b0;
+                    UCAS_N <= 1'b0;
+                    dtimer <= 8'd0;
+                    dstate <= D_CBR_RAS_LOW;
+                end
+
+                D_CBR_RAS_LOW: begin
+                    RAS_N       <= 1'b0;
+                    dtimer      <= 8'd0;
+                    ras_low_cnt <= 8'd0;
+                    dstate      <= D_CBR_TRAS_WAIT;
+                end
+
+                D_CBR_TRAS_WAIT: begin
+                    if (ras_low_cnt >= C_RAS_MIN) begin
+                        dstate <= D_CBR_RAS_HIGH;
+                        dtimer <= 8'd0;
+                    end
+                end
+
+                D_CBR_RAS_HIGH: begin
+                    RAS_N  <= 1'b1;
+                    dtimer <= 8'd0;
+                    dstate <= D_CBR_CAS_HIGH;
+                end
+
+                D_CBR_CAS_HIGH: begin
+                    LCAS_N <= 1'b1;
+                    UCAS_N <= 1'b1;
+                    dstate <= D_DONE;
+                end
+
+                D_DONE: begin
+                    if (refresh_req && !req_valid)
+                        refresh_req <= 1'b0;
+
+                    refresh_timer <= 16'd0;
+
+                    dstate <= D_IDLE;
+                end
+
+                default: dstate <= D_IDLE;
+            endcase
+
+            // LEDs: status visibility
+            LED_OUT[2:0]   <= mstate;
+            LED_OUT[8:3]   <= dstate;
+            LED_OUT[9]     <= req_valid;
+            LED_OUT[10]    <= req_rw;
+            LED_OUT[11]    <= pattern_is_ones;
+            LED_OUT[12]    <= refresh_req;
+            LED_OUT[13]    <= init_done;
+            LED_OUT[15:14] <= addr_ctr[17:16];
+        end
+    end
+
+endmodule
